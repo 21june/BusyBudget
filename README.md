@@ -19,6 +19,7 @@ Busy Budget is a privacy-friendly personal finance app built with Flutter. It he
 - Set a total monthly budget and optional category budgets.
 - Manage custom accounts and separate income and expense categories.
 - Export a complete XLSX backup and restore it with validation and transactional replacement.
+- Schedule automatic XLSX backups and bulk-delete automatic backups older than a chosen number of days.
 - Import legacy XLSX files exported by the Korean *My Budget Book* app.
 - Choose system, light, or dark appearance.
 - Keep everything local in SQLite. The app does not request SMS access or auto-create transactions from messages.

@@ -13,6 +13,7 @@ import 'data/app_database.dart';
 import 'models/backup_bundle.dart';
 import 'models/recurring_plan.dart';
 import 'models/transaction_entry.dart';
+import 'services/auto_backup_service.dart';
 import 'services/xlsx_service.dart';
 import 'utils/currency_format.dart';
 
@@ -23,10 +24,6 @@ Uint8List _exportXlsxInBackground(BackupBundle bundle) =>
     XlsxService().exportBundle(bundle);
 
 String _displayOption(String value) => switch (value) {
-  '카드' => 'Card',
-  '현금' => 'Cash',
-  '식비' => 'Food',
-  '급여' => 'Salary',
   _ => value.trim().isEmpty ? '?' : value,
 };
 
@@ -43,13 +40,41 @@ class BusyBudgetApp extends StatefulWidget {
   State<BusyBudgetApp> createState() => _BusyBudgetAppState();
 }
 
-class _BusyBudgetAppState extends State<BusyBudgetApp> {
+class _BusyBudgetAppState extends State<BusyBudgetApp>
+    with WidgetsBindingObserver {
   var themeMode = ThemeMode.system;
+  Timer? autoBackupTimer;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadThemeMode();
+    unawaited(_checkAutoBackup());
+    autoBackupTimer = Timer.periodic(
+      const Duration(hours: 1),
+      (_) => unawaited(_checkAutoBackup()),
+    );
+  }
+
+  @override
+  void dispose() {
+    autoBackupTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) unawaited(_checkAutoBackup());
+  }
+
+  Future<void> _checkAutoBackup() async {
+    try {
+      await AutoBackupService.instance.runIfDue();
+    } catch (_) {
+      // The service stores the error for the Settings screen to report.
+    }
   }
 
   Future<void> _loadThemeMode() async {
@@ -72,7 +97,7 @@ class _BusyBudgetAppState extends State<BusyBudgetApp> {
   @override
   Widget build(BuildContext context) => MaterialApp(
     debugShowCheckedModeBanner: false,
-    title: 'Busy Budget',
+    title: '바쁜 가계부',
     localizationsDelegates: GlobalMaterialLocalizations.delegates,
     supportedLocales: const [Locale('ko', 'KR'), Locale('en', 'US')],
     themeMode: themeMode,
@@ -119,7 +144,7 @@ class _LedgerHomeState extends State<LedgerHome> {
   final searchController = SearchController();
   final searchFocusNode = FocusNode();
   final ledgerScrollController = ScrollController();
-  final todaySectionKey = GlobalKey();
+  final positionedSectionKey = GlobalKey();
   Timer? searchDebounce;
   var positionedInitialMonth = false;
   var loadGeneration = 0;
@@ -136,6 +161,7 @@ class _LedgerHomeState extends State<LedgerHome> {
   int? searchMinimumAmount;
   int? searchMaximumAmount;
   var searchOrder = 'newest';
+  DateTime? positionTargetDate;
   var assets = <String>[];
   var categories = <String>[];
 
@@ -203,19 +229,24 @@ class _LedgerHomeState extends State<LedgerHome> {
       return;
     }
     positionedInitialMonth = true;
+    positionTargetDate = now;
     WidgetsBinding.instance.addPostFrameCallback(
-      (_) => _positionToday(animate: false),
+      (_) => _positionDate(now, animate: false),
     );
   }
 
-  Future<void> _positionToday({required bool animate}) async {
+  Future<void> _positionDate(
+    DateTime targetDate, {
+    required bool animate,
+  }) async {
     if (!mounted || !ledgerScrollController.hasClients || entries.isEmpty) {
       return;
     }
-    final now = DateTime.now();
-    var targetIndex = entries.indexWhere((entry) => _sameDay(entry.date, now));
+    var targetIndex = entries.indexWhere(
+      (entry) => _sameDay(entry.date, targetDate),
+    );
     targetIndex = targetIndex < 0
-        ? entries.indexWhere((entry) => !entry.date.isAfter(now))
+        ? entries.indexWhere((entry) => !entry.date.isAfter(targetDate))
         : targetIndex;
     if (targetIndex < 0) targetIndex = 0;
     var estimatedOffset = 0.0;
@@ -239,7 +270,7 @@ class _LedgerHomeState extends State<LedgerHome> {
       ledgerScrollController.jumpTo(offset);
     }
     if (!mounted) return;
-    final targetContext = todaySectionKey.currentContext;
+    final targetContext = positionedSectionKey.currentContext;
     if (targetContext != null && targetContext.mounted) {
       await Scrollable.ensureVisible(
         targetContext,
@@ -253,30 +284,49 @@ class _LedgerHomeState extends State<LedgerHome> {
     final now = DateTime.now();
     if (month.year != now.year || month.month != now.month) {
       month = DateTime(now.year, now.month);
+      positionTargetDate = now;
       await _load();
       if (!mounted) return;
       WidgetsBinding.instance.addPostFrameCallback(
-        (_) => _positionToday(animate: false),
+        (_) => _positionDate(now, animate: false),
       );
       return;
     }
-    await _positionToday(animate: true);
+    positionTargetDate = now;
+    await _positionDate(now, animate: true);
+  }
+
+  Future<void> _showAddEntry() async {
+    final savedDate = await showDialog<DateTime>(
+      context: context,
+      builder: (_) => EntryDialog(db: db),
+    );
+    if (savedDate == null || !mounted) return;
+    setState(() {
+      tab = 0;
+      month = DateTime(savedDate.year, savedDate.month);
+      positionTargetDate = savedDate;
+      query = '';
+      searchController.clear();
+      searchDebounce?.cancel();
+    });
+    await _refreshData();
+    if (!mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => _positionDate(savedDate, animate: false),
+    );
   }
 
   @override
   Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(
-      title: Text(['Transactions', 'Search', 'Statistics', 'Settings'][tab]),
+      title: Text(['내역', '검색', '통계', '설정'][tab]),
       centerTitle: false,
       actions: tab < 3
           ? [
               IconButton(
                 onPressed: () async {
-                  await showDialog(
-                    context: context,
-                    builder: (_) => EntryDialog(db: db),
-                  );
-                  await _refreshData();
+                  await _showAddEntry();
                 },
                 icon: const Icon(Icons.add_circle_outline),
               ),
@@ -307,29 +357,25 @@ class _LedgerHomeState extends State<LedgerHome> {
         NavigationDestination(
           icon: Icon(Icons.calendar_month_outlined),
           selectedIcon: Icon(Icons.calendar_month),
-          label: 'Transactions',
+          label: '내역',
         ),
-        NavigationDestination(icon: Icon(Icons.search), label: 'Search'),
+        NavigationDestination(icon: Icon(Icons.search), label: '검색'),
         NavigationDestination(
           icon: Icon(Icons.pie_chart_outline),
           selectedIcon: Icon(Icons.pie_chart),
-          label: 'Statistics',
+          label: '통계',
         ),
         NavigationDestination(
           icon: Icon(Icons.settings_outlined),
           selectedIcon: Icon(Icons.settings),
-          label: 'Settings',
+          label: '설정',
         ),
       ],
     ),
     floatingActionButton: tab < 2
         ? FloatingActionButton(
             onPressed: () async {
-              await showDialog(
-                context: context,
-                builder: (_) => EntryDialog(db: db),
-              );
-              await _refreshData();
+              await _showAddEntry();
             },
             child: const Icon(Icons.add),
           )
@@ -371,7 +417,7 @@ class _LedgerHomeState extends State<LedgerHome> {
           icon: const Icon(Icons.chevron_left),
         ),
         Text(
-          DateFormat('MMMM yyyy', 'en_US').format(month),
+          DateFormat('yyyy년 M월', 'ko').format(month),
           style: Theme.of(context).textTheme.titleLarge
               ?.copyWith(fontWeight: FontWeight.bold),
         ),
@@ -468,13 +514,11 @@ class _LedgerHomeState extends State<LedgerHome> {
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: Row(
             children: [
-              Expanded(child: _summary('Income', income, Colors.blue)),
+              Expanded(child: _summary('수입', income, Colors.blue)),
               const SizedBox(width: 10),
-              Expanded(child: _summary('Expenses', expense, Colors.red)),
+              Expanded(child: _summary('지출', expense, Colors.red)),
               const SizedBox(width: 10),
-              Expanded(
-                child: _summary('Balance', income - expense, Colors.teal),
-              ),
+              Expanded(child: _summary('잔액', income - expense, Colors.teal)),
             ],
           ),
         ),
@@ -487,19 +531,13 @@ class _LedgerHomeState extends State<LedgerHome> {
                     children: [
                       const Icon(Icons.receipt_long_outlined, size: 48),
                       const SizedBox(height: 12),
-                      const Text('No transactions to display.'),
+                      const Text('표시할 내역이 없습니다.'),
                       if (!search) ...[
                         const SizedBox(height: 12),
                         FilledButton.icon(
-                          onPressed: () async {
-                            await showDialog(
-                              context: context,
-                              builder: (_) => EntryDialog(db: db),
-                            );
-                            await _refreshData();
-                          },
+                          onPressed: _showAddEntry,
                           icon: const Icon(Icons.add),
-                          label: const Text('Add first transaction'),
+                          label: const Text('첫 거래 입력'),
                         ),
                       ],
                     ],
@@ -515,21 +553,13 @@ class _LedgerHomeState extends State<LedgerHome> {
                     final showDayHeader =
                         !search &&
                         (i == 0 || !_sameDay(entries[i - 1].date, e.date));
-                    final isInitialTarget =
+                    final isPositionTarget =
                         !search &&
                         showDayHeader &&
-                        (_sameDay(e.date, DateTime.now()) ||
-                            (!entries.any(
-                                  (entry) =>
-                                      _sameDay(entry.date, DateTime.now()),
-                                ) &&
-                                !e.date.isAfter(DateTime.now()) &&
-                                (i == 0 ||
-                                    entries[i - 1].date.isAfter(
-                                      DateTime.now(),
-                                    ))));
+                        positionTargetDate != null &&
+                        _sameDay(e.date, positionTargetDate!);
                     return Column(
-                      key: isInitialTarget ? todaySectionKey : null,
+                      key: isPositionTarget ? positionedSectionKey : null,
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
                         if (showDayHeader)
@@ -552,11 +582,11 @@ class _LedgerHomeState extends State<LedgerHome> {
                             ),
                             subtitle: Text(
                               search
-                                  ? '${DateFormat('MMM d', 'en_US').format(e.date)} · ${_displayOption(e.asset)} · ${e.merchant}'
+                                  ? '${DateFormat('M월 d일').format(e.date)} · ${_displayOption(e.asset)} · ${e.merchant}'
                                   : '${_displayOption(e.asset)} · ${e.merchant}',
                             ),
                             trailing: Text(
-                              '${e.flow == '지출' ? '-' : '+'}${NumberFormat('#,###').format(e.amount)} KRW',
+                              '${e.flow == '지출' ? '-' : '+'}${NumberFormat('#,###').format(e.amount)}원',
                               style: TextStyle(
                                 fontWeight: FontWeight.bold,
                                 color: e.flow == '지출'
@@ -609,7 +639,7 @@ class _LedgerHomeState extends State<LedgerHome> {
             ],
             Flexible(
               child: Text(
-                '${isToday ? 'Today · ' : ''}${DateFormat('EEEE, MMM d', 'en_US').format(date)}',
+                '${isToday ? '오늘 · ' : ''}${DateFormat('M월 d일 EEEE', 'ko').format(date)}',
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: Theme.of(context).textTheme.titleSmall?.copyWith(
@@ -1342,7 +1372,7 @@ class _EntryDialogState extends State<EntryDialog> {
     }
     if (mounted) {
       final messenger = ScaffoldMessenger.maybeOf(context);
-      Navigator.pop(context, true);
+      Navigator.pop(context, date);
       messenger?.showSnackBar(
         SnackBar(content: Text(duplicating ? '새 거래를 저장했습니다.' : '거래를 저장했습니다.')),
       );
@@ -1743,7 +1773,7 @@ class _StatsPageState extends State<StatsPage> {
               icon: const Icon(Icons.chevron_left),
             ),
             Text(
-              DateFormat('MMMM yyyy', 'en_US').format(widget.month),
+              DateFormat('yyyy년 M월').format(widget.month),
               style: Theme.of(context).textTheme.titleLarge,
             ),
             IconButton(
@@ -1751,7 +1781,7 @@ class _StatsPageState extends State<StatsPage> {
               icon: const Icon(Icons.chevron_right),
             ),
             IconButton(
-              tooltip: 'Monthly budget',
+              tooltip: '월 예산 설정',
               onPressed: _manageBudgets,
               icon: const Icon(Icons.account_balance_wallet_outlined),
             ),
@@ -1762,7 +1792,7 @@ class _StatsPageState extends State<StatsPage> {
           child: TextButton.icon(
             onPressed: _showPeriodStats,
             icon: const Icon(Icons.date_range_outlined),
-            label: const Text('Custom date range'),
+            label: const Text('기간 직접 분석'),
           ),
         ),
         FutureBuilder<List<TransactionEntry>>(
@@ -1784,7 +1814,7 @@ class _StatsPageState extends State<StatsPage> {
               children: [
                 Expanded(
                   child: _comparisonCard(
-                    'Income',
+                    '수입',
                     currentIncome,
                     previousIncome,
                     Colors.blue,
@@ -1793,7 +1823,7 @@ class _StatsPageState extends State<StatsPage> {
                 const SizedBox(width: 10),
                 Expanded(
                   child: _comparisonCard(
-                    'Expenses',
+                    '지출',
                     currentExpense,
                     previousExpense,
                     Colors.red,
@@ -1819,7 +1849,7 @@ class _StatsPageState extends State<StatsPage> {
         SizedBox(
           height: 260,
           child: total == 0
-              ? const Center(child: Text('No expense data for this month.'))
+              ? const Center(child: Text('지출 통계가 없습니다.'))
               : PieChart(
                   PieChartData(
                     centerSpaceRadius: 52,
@@ -1850,7 +1880,7 @@ class _StatsPageState extends State<StatsPage> {
             ),
             title: Text(_displayOption(item.value.key)),
             trailing: Text(
-              '${NumberFormat('#,###').format(item.value.value)} KRW',
+              '${NumberFormat('#,###').format(item.value.value)}원',
             ),
             onTap: () => _showCategoryDetails(item.value.key),
           ),
@@ -1897,10 +1927,7 @@ class _StatsPageState extends State<StatsPage> {
               onPressed: () => _moveYear(-1),
               icon: const Icon(Icons.chevron_left),
             ),
-            Text(
-              '$year Monthly Trend',
-              style: Theme.of(context).textTheme.titleLarge,
-            ),
+            Text('$year년 월별 추이', style: Theme.of(context).textTheme.titleLarge),
             IconButton(
               onPressed: () => _moveYear(1),
               icon: const Icon(Icons.chevron_right),
@@ -1937,12 +1964,12 @@ class _StatsPageState extends State<StatsPage> {
                 const Icon(Icons.event_repeat_outlined),
                 const SizedBox(width: 10),
                 Text(
-                  'Planned Fixed Expenses',
+                  '예정된 고정 지출',
                   style: Theme.of(context).textTheme.titleMedium,
                 ),
                 const Spacer(),
                 Text(
-                  '${NumberFormat('#,###').format(total)} KRW',
+                  '${NumberFormat('#,###').format(total)}원',
                   style: const TextStyle(fontWeight: FontWeight.bold),
                 ),
               ],
@@ -1950,17 +1977,15 @@ class _StatsPageState extends State<StatsPage> {
             const SizedBox(height: 12),
             Row(
               children: [
-                const Expanded(child: Text('Installments')),
-                Text(
-                  '${NumberFormat('#,###').format(amounts.installment)} KRW',
-                ),
+                const Expanded(child: Text('할부')),
+                Text('${NumberFormat('#,###').format(amounts.installment)}원'),
               ],
             ),
             const SizedBox(height: 6),
             Row(
               children: [
-                const Expanded(child: Text('Recurring')),
-                Text('${NumberFormat('#,###').format(amounts.recurring)} KRW'),
+                const Expanded(child: Text('정기결제')),
+                Text('${NumberFormat('#,###').format(amounts.recurring)}원'),
               ],
             ),
           ],
@@ -1983,10 +2008,7 @@ class _StatsPageState extends State<StatsPage> {
             children: [
               const Icon(Icons.account_balance_outlined),
               const SizedBox(width: 10),
-              Text(
-                'Cash Flow by Account',
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
+              Text('자산별 흐름', style: Theme.of(context).textTheme.titleMedium),
             ],
           ),
           const SizedBox(height: 12),
@@ -2040,11 +2062,11 @@ class _StatsPageState extends State<StatsPage> {
           const Row(
             mainAxisAlignment: MainAxisAlignment.end,
             children: [
-              Text('Income', style: TextStyle(color: Colors.blue)),
+              Text('수입', style: TextStyle(color: Colors.blue)),
               SizedBox(width: 18),
-              Text('Expenses', style: TextStyle(color: Colors.red)),
+              Text('지출', style: TextStyle(color: Colors.red)),
               SizedBox(width: 18),
-              Text('Net'),
+              Text('순액'),
             ],
           ),
         ],
@@ -2197,7 +2219,7 @@ class _StatsPageState extends State<StatsPage> {
 
   Widget _comparisonCard(String label, int current, int previous, Color color) {
     final change = previous == 0
-        ? (current == 0 ? '0%' : 'New')
+        ? (current == 0 ? '0%' : '신규')
         : '${((current - previous) / previous * 100) >= 0 ? '+' : ''}'
               '${((current - previous) / previous * 100).toStringAsFixed(1)}%';
     return Card(
@@ -2210,14 +2232,11 @@ class _StatsPageState extends State<StatsPage> {
             const SizedBox(height: 4),
             FittedBox(
               child: Text(
-                '${NumberFormat('#,###').format(current)} KRW',
+                '${NumberFormat('#,###').format(current)}원',
                 style: const TextStyle(fontWeight: FontWeight.bold),
               ),
             ),
-            Text(
-              'vs. last month: $change',
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
+            Text('전월 대비 $change', style: Theme.of(context).textTheme.bodySmall),
           ],
         ),
       ),
@@ -2519,6 +2538,247 @@ class _PeriodStatsDialogState extends State<PeriodStatsDialog> {
   );
 }
 
+class AutoBackupSettingsCard extends StatefulWidget {
+  const AutoBackupSettingsCard({super.key, required this.db});
+
+  final AppDatabase db;
+
+  @override
+  State<AutoBackupSettingsCard> createState() => _AutoBackupSettingsCardState();
+}
+
+class _AutoBackupSettingsCardState extends State<AutoBackupSettingsCard> {
+  final service = AutoBackupService.instance;
+  var intervalDays = 0;
+  var loading = true;
+  var busy = false;
+  String? lastAt;
+  String? lastFile;
+  String? lastError;
+  String? directoryPath;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final values = await Future.wait<String?>([
+      widget.db.setting(AutoBackupService.intervalSetting),
+      widget.db.setting(AutoBackupService.lastAtSetting),
+      widget.db.setting(AutoBackupService.lastFileSetting),
+      widget.db.setting(AutoBackupService.lastErrorSetting),
+    ]);
+    final directory = await service.backupDirectory();
+    if (!mounted) return;
+    setState(() {
+      intervalDays = int.tryParse(values[0] ?? '') ?? 0;
+      lastAt = values[1];
+      lastFile = values[2];
+      lastError = values[3];
+      directoryPath = directory.path;
+      loading = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => Card(
+    child: Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.backup_outlined),
+              SizedBox(width: 12),
+              Text('자동 백업'),
+            ],
+          ),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<int>(
+            initialValue: intervalDays,
+            decoration: const InputDecoration(labelText: '백업 주기'),
+            items: const [
+              DropdownMenuItem(value: 0, child: Text('사용 안 함')),
+              DropdownMenuItem(value: 1, child: Text('매일')),
+              DropdownMenuItem(value: 7, child: Text('매주')),
+              DropdownMenuItem(value: 30, child: Text('매월 (30일)')),
+            ],
+            onChanged: loading || busy
+                ? null
+                : (value) => _changeInterval(value ?? 0),
+          ),
+          const SizedBox(height: 8),
+          const Text('앱을 실행하거나 다시 열 때 주기를 확인하며, 앱을 사용하는 동안에는 매시간 확인합니다.'),
+          if (lastAt != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              '최근 자동 백업: ${_formatBackupTime(lastAt!)}'
+              '${lastFile == null ? '' : ' · $lastFile'}',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
+          if (lastError?.isNotEmpty == true) ...[
+            const SizedBox(height: 6),
+            Text(
+              '최근 오류: $lastError',
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+          ],
+          if (directoryPath != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              '저장 위치: $directoryPath',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              FilledButton.tonalIcon(
+                onPressed: busy ? null : _backupNow,
+                icon: busy
+                    ? const SizedBox.square(
+                        dimension: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.save_outlined),
+                label: const Text('지금 백업'),
+              ),
+              OutlinedButton.icon(
+                onPressed: busy ? null : _deleteOldBackups,
+                icon: const Icon(Icons.delete_sweep_outlined),
+                label: const Text('오래된 백업 삭제'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    ),
+  );
+
+  String _formatBackupTime(String value) {
+    final parsed = DateTime.tryParse(value)?.toLocal();
+    return parsed == null
+        ? value
+        : DateFormat('yyyy-MM-dd HH:mm').format(parsed);
+  }
+
+  Future<void> _changeInterval(int value) async {
+    setState(() {
+      intervalDays = value;
+      busy = true;
+    });
+    try {
+      await service.setIntervalDays(value);
+      if (value > 0) await service.runIfDue();
+      await _load();
+    } catch (error) {
+      if (mounted) _showMessage('자동 백업 설정 실패: $error');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _backupNow() async {
+    setState(() => busy = true);
+    try {
+      final file = await service.createBackup();
+      await _load();
+      if (mounted && file != null) {
+        _showMessage(
+          '자동 백업 폴더에 ${file.path.split(RegExp(r'[/\\]')).last} 저장 완료',
+        );
+      }
+    } catch (error) {
+      if (mounted) _showMessage('백업 실패: $error');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _deleteOldBackups() async {
+    final controller = TextEditingController(text: '30');
+    final days = await showDialog<int>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('오래된 자동 백업 찾기'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: '보관 기간(일)',
+            helperText: '이 일수보다 오래된 자동 백업만 찾습니다.',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('취소'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final value = int.tryParse(controller.text.trim());
+              if (value != null && value > 0) {
+                Navigator.pop(dialogContext, value);
+              }
+            },
+            child: const Text('찾기'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (days == null || !mounted) return;
+
+    setState(() => busy = true);
+    try {
+      final files = await service.filesOlderThan(days);
+      if (!mounted) return;
+      if (files.isEmpty) {
+        _showMessage('$days일보다 오래된 자동 백업이 없습니다.');
+        return;
+      }
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('오래된 백업 삭제'),
+          content: Text(
+            '$days일보다 오래된 자동 백업 ${files.length}개를 삭제합니다.\n\n'
+            '수동으로 만든 백업 파일은 삭제하지 않습니다. 이 작업은 취소할 수 없습니다.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('취소'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('일괄 삭제'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return;
+      final deleted = await service.deleteOlderThan(days);
+      if (mounted) _showMessage('오래된 자동 백업 $deleted개를 삭제했습니다.');
+    } catch (error) {
+      if (mounted) _showMessage('백업 삭제 실패: $error');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  void _showMessage(String message) =>
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(message)));
+}
+
 class SettingsPage extends StatelessWidget {
   const SettingsPage({
     super.key,
@@ -2577,6 +2837,8 @@ class SettingsPage extends StatelessWidget {
           ),
         ),
       ),
+      const SizedBox(height: 16),
+      AutoBackupSettingsCard(db: db),
       const SizedBox(height: 16),
       Card(
         child: Column(
@@ -2775,6 +3037,9 @@ class SettingsPage extends StatelessWidget {
       ),
     );
     if (confirm != true) return;
+    if (!context.mounted) return;
+    final rootNavigator = Navigator.of(context, rootNavigator: true);
+    final messenger = ScaffoldMessenger.maybeOf(context);
     var progressOpen = false;
     try {
       final files = await FilePicker.pickFiles(
@@ -2813,7 +3078,7 @@ class SettingsPage extends StatelessWidget {
       );
       final currentCount = await db.transactionCount();
       if (!context.mounted) return;
-      Navigator.of(context, rootNavigator: true).pop();
+      rootNavigator.pop();
       progressOpen = false;
 
       final replace = await showDialog<bool>(
@@ -2840,12 +3105,12 @@ class SettingsPage extends StatelessWidget {
           ],
         ),
       );
-      if (replace != true || !context.mounted) return;
+      if (replace != true || !rootNavigator.mounted) return;
 
       progressOpen = true;
       unawaited(
         showDialog<void>(
-          context: context,
+          context: rootNavigator.context,
           barrierDismissible: false,
           builder: (_) => const PopScope(
             canPop: false,
@@ -2863,6 +3128,10 @@ class SettingsPage extends StatelessWidget {
       );
       await WidgetsBinding.instance.endOfFrame;
       final databaseCount = await db.restoreBundle(bundle);
+      if (progressOpen && rootNavigator.mounted) {
+        rootNavigator.pop();
+        progressOpen = false;
+      }
       final restoredTheme = bundle.settings['theme_mode'];
       if (restoredTheme != null) {
         onThemeModeChanged(switch (restoredTheme) {
@@ -2872,12 +3141,10 @@ class SettingsPage extends StatelessWidget {
         });
       }
       await onChanged();
-      if (context.mounted) {
-        Navigator.of(context, rootNavigator: true).pop();
-        progressOpen = false;
+      if (rootNavigator.mounted) {
         await showDialog<void>(
-          context: context,
-          builder: (_) => AlertDialog(
+          context: rootNavigator.context,
+          builder: (dialogContext) => AlertDialog(
             title: const Text('복원 완료'),
             content: Text(
               '기존 거래를 모두 교체했습니다.\n\n'
@@ -2887,7 +3154,7 @@ class SettingsPage extends StatelessWidget {
             ),
             actions: [
               FilledButton(
-                onPressed: () => Navigator.pop(context),
+                onPressed: () => Navigator.pop(dialogContext),
                 child: const Text('확인'),
               ),
             ],
@@ -2895,57 +3162,23 @@ class SettingsPage extends StatelessWidget {
         );
       }
     } catch (e) {
-      if (context.mounted) {
-        if (progressOpen) {
-          Navigator.of(context, rootNavigator: true).pop();
-          progressOpen = false;
-        }
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('복원 실패(기존 데이터 유지): $e')));
+      if (progressOpen && rootNavigator.mounted) {
+        rootNavigator.pop();
+        progressOpen = false;
+      }
+      if (messenger?.mounted == true) {
+        messenger!.showSnackBar(
+          SnackBar(content: Text('복원 실패(기존 데이터 유지): $e')),
+        );
       }
     }
   }
 
   Future<void> _clearAllData(BuildContext context) async {
-    final controller = TextEditingController();
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('가계부 데이터 초기화'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            const Text(
-              '모든 거래, 정기결제, 월별 예산과 사용자 자산·종류가 삭제됩니다. '
-              '이 작업은 취소할 수 없습니다. 먼저 백업하는 것을 권장합니다.',
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: controller,
-              autofocus: true,
-              decoration: const InputDecoration(labelText: '확인을 위해 초기화 입력'),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('취소'),
-          ),
-          ListenableBuilder(
-            listenable: controller,
-            builder: (_, _) => FilledButton(
-              onPressed: controller.text.trim() == '초기화'
-                  ? () => Navigator.pop(dialogContext, true)
-                  : null,
-              child: const Text('모두 삭제'),
-            ),
-          ),
-        ],
-      ),
+      builder: (_) => const _ClearLedgerConfirmationDialog(),
     );
-    controller.dispose();
     if (confirmed != true) return;
     await db.clearLedgerData();
     await onChanged();
@@ -2953,6 +3186,59 @@ class SettingsPage extends StatelessWidget {
     ScaffoldMessenger.of(context)
         .showSnackBar(const SnackBar(content: Text('가계부 데이터를 초기화했습니다.')));
   }
+}
+
+class _ClearLedgerConfirmationDialog extends StatefulWidget {
+  const _ClearLedgerConfirmationDialog();
+
+  @override
+  State<_ClearLedgerConfirmationDialog> createState() =>
+      _ClearLedgerConfirmationDialogState();
+}
+
+class _ClearLedgerConfirmationDialogState
+    extends State<_ClearLedgerConfirmationDialog> {
+  final controller = TextEditingController();
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('가계부 데이터 초기화'),
+    content: Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Text(
+          '모든 거래, 정기결제, 월별 예산과 사용자 자산·종류가 삭제됩니다. '
+          '이 작업은 취소할 수 없습니다. 먼저 백업하는 것을 권장합니다.',
+        ),
+        const SizedBox(height: 16),
+        TextField(
+          controller: controller,
+          autofocus: true,
+          onChanged: (_) => setState(() {}),
+          decoration: const InputDecoration(labelText: '확인을 위해 초기화 입력'),
+        ),
+      ],
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context, false),
+        child: const Text('취소'),
+      ),
+      FilledButton(
+        onPressed: controller.text.trim() == '초기화'
+            ? () => Navigator.pop(context, true)
+            : null,
+        child: const Text('모두 삭제'),
+      ),
+    ],
+  );
 }
 
 class RecurringManagerDialog extends StatefulWidget {

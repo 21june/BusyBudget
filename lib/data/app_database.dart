@@ -651,14 +651,20 @@ class AppDatabase {
     final usedRows = await db.rawQuery(
       'SELECT COUNT(*) AS value FROM transactions WHERE $field = ?'
       '${flowFilter == null ? '' : ' AND flow = ?'}',
-      [name, ...?(flowFilter == null ? null : [flowFilter])],
+      [
+        name,
+        ...?(flowFilter == null ? null : [flowFilter]),
+      ],
     );
     final used = usedRows.first['value']! as int;
     if (used > 0) return false;
     await db.delete(
       table,
       where: 'name = ?${flowFilter == null ? '' : ' AND flow = ?'}',
-      whereArgs: [name, ...?(flowFilter == null ? null : [flowFilter])],
+      whereArgs: [
+        name,
+        ...?(flowFilter == null ? null : [flowFilter]),
+      ],
     );
     return true;
   }
@@ -721,56 +727,82 @@ class AppDatabase {
       if (bundle.formatVersion >= 3) {
         await txn.delete('monthly_budgets');
       }
+      final assets = <String>{};
+      void addAsset(String rawName) {
+        final name = rawName.trim();
+        if (name.isNotEmpty) assets.add(name);
+      }
+
+      final categories = <({String name, String flow})>{};
+      void addCategory(String rawName, String flow) {
+        final name = rawName.trim();
+        if (name.isNotEmpty) categories.add((name: name, flow: flow));
+      }
+
+      for (final asset in bundle.assets) {
+        addAsset(asset);
+      }
+      for (final category in bundle.categories) {
+        addCategory(category, '지출');
+      }
+      for (final category in bundle.incomeCategories) {
+        addCategory(category, '수입');
+      }
+      for (final entry in bundle.entries) {
+        addAsset(entry.asset);
+        addCategory(entry.category, entry.flow);
+      }
+      for (final plan in bundle.recurringPlans) {
+        addAsset(plan.asset);
+        addCategory(plan.category, plan.flow);
+      }
+      addCategory('식비', '지출');
+      addCategory('월급', '수입');
+
       final batch = txn.batch();
       for (final entry in bundle.entries) {
         batch.insert('transactions', entry.toMap()..remove('id'));
       }
-      await batch.commit(noResult: true);
-      for (final asset in bundle.assets) {
-        await _ensureOption(txn, 'assets', asset);
+      var assetOrder = 1;
+      for (final asset in assets) {
+        batch.insert('assets', {
+          'name': asset,
+          'sort_order': assetOrder++,
+        }, conflictAlgorithm: ConflictAlgorithm.ignore);
       }
-      for (final category in bundle.categories) {
-        await _ensureOption(txn, 'categories', category, flow: '지출');
+      final categoryOrder = <String, int>{};
+      for (final category in categories) {
+        final order = (categoryOrder[category.flow] ?? 0) + 1;
+        categoryOrder[category.flow] = order;
+        batch.insert('categories', {
+          'name': category.name,
+          'flow': category.flow,
+          'sort_order': order,
+        }, conflictAlgorithm: ConflictAlgorithm.ignore);
       }
-      for (final category in bundle.incomeCategories) {
-        await _ensureOption(txn, 'categories', category, flow: '수입');
-      }
-      for (final asset in bundle.entries.map((entry) => entry.asset).toSet()) {
-        await _ensureOption(txn, 'assets', asset);
-      }
-      for (final entry in bundle.entries) {
-        await _ensureOption(
-          txn,
-          'categories',
-          entry.category,
-          flow: entry.flow,
-        );
-      }
-      if (bundle.recurringPlans.isEmpty) {
-        await _restoreActiveRecurringPlans(txn);
-      } else {
+      if (bundle.recurringPlans.isNotEmpty) {
         for (final plan in bundle.recurringPlans) {
-          await txn.insert('recurring_plans', plan.toMap());
-          await _ensureOption(
-            txn,
-            'categories',
-            plan.category,
-            flow: plan.flow,
-          );
+          batch.insert('recurring_plans', plan.toMap());
         }
       }
-      await _ensureOption(txn, 'categories', '식비', flow: '지출');
-      await _ensureOption(txn, 'categories', '월급', flow: '수입');
       for (final setting in bundle.settings.entries) {
-        await txn.insert('app_settings', {
+        batch.insert('app_settings', {
           'key': setting.key,
           'value': setting.value,
         }, conflictAlgorithm: ConflictAlgorithm.replace);
       }
       if (bundle.formatVersion >= 3) {
         for (final budget in bundle.monthlyBudgets) {
-          await txn.insert('monthly_budgets', budget.toMap());
+          batch.insert(
+            'monthly_budgets',
+            budget.toMap(),
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
         }
+      }
+      await batch.commit(noResult: true);
+      if (bundle.recurringPlans.isEmpty) {
+        await _restoreActiveRecurringPlans(txn);
       }
       await _materializeRecurringPayments(txn, DateTime.now());
     });
@@ -789,9 +821,9 @@ class AppDatabase {
   static Future<void> _ensureOption(
     DatabaseExecutor db,
     String table,
-    String rawName,
-    {String? flow}
-  ) async {
+    String rawName, {
+    String? flow,
+  }) async {
     final name = rawName.trim();
     if (name.isEmpty) return;
     final nextRows = await db.rawQuery(

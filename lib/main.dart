@@ -2702,38 +2702,10 @@ class _AutoBackupSettingsCardState extends State<AutoBackupSettingsCard> {
   }
 
   Future<void> _deleteOldBackups() async {
-    final controller = TextEditingController(text: '30');
     final days = await showDialog<int>(
       context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('오래된 자동 백업 찾기'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          keyboardType: TextInputType.number,
-          decoration: const InputDecoration(
-            labelText: '보관 기간(일)',
-            helperText: '이 일수보다 오래된 자동 백업만 찾습니다.',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
-            child: const Text('취소'),
-          ),
-          FilledButton(
-            onPressed: () {
-              final value = int.tryParse(controller.text.trim());
-              if (value != null && value > 0) {
-                Navigator.pop(dialogContext, value);
-              }
-            },
-            child: const Text('찾기'),
-          ),
-        ],
-      ),
+      builder: (_) => const _BackupRetentionDaysDialog(),
     );
-    controller.dispose();
     if (days == null || !mounted) return;
 
     setState(() => busy = true);
@@ -2777,6 +2749,61 @@ class _AutoBackupSettingsCardState extends State<AutoBackupSettingsCard> {
   void _showMessage(String message) =>
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text(message)));
+}
+
+class _BackupRetentionDaysDialog extends StatefulWidget {
+  const _BackupRetentionDaysDialog();
+
+  @override
+  State<_BackupRetentionDaysDialog> createState() =>
+      _BackupRetentionDaysDialogState();
+}
+
+class _BackupRetentionDaysDialogState
+    extends State<_BackupRetentionDaysDialog> {
+  final controller = TextEditingController(text: '30');
+
+  int? get days {
+    final value = int.tryParse(controller.text.trim());
+    return value != null && value > 0 ? value : null;
+  }
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('오래된 자동 백업 찾기'),
+    content: TextField(
+      controller: controller,
+      autofocus: true,
+      keyboardType: TextInputType.number,
+      onChanged: (_) => setState(() {}),
+      onSubmitted: (_) => _submit(),
+      decoration: const InputDecoration(
+        labelText: '보관 기간(일)',
+        helperText: '이 일수보다 오래된 자동 백업만 찾습니다.',
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('취소'),
+      ),
+      FilledButton(
+        onPressed: days == null ? null : _submit,
+        child: const Text('찾기'),
+      ),
+    ],
+  );
+
+  void _submit() {
+    final value = days;
+    if (value != null) Navigator.pop(context, value);
+  }
 }
 
 class SettingsPage extends StatelessWidget {

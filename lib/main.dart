@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:fl_chart/fl_chart.dart';
@@ -8,6 +9,8 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:intl/date_symbol_data_local.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 
 import 'data/app_database.dart';
 import 'models/backup_bundle.dart';
@@ -22,6 +25,25 @@ BackupBundle _parseXlsxInBackground(Uint8List bytes) =>
 
 Uint8List _exportXlsxInBackground(BackupBundle bundle) =>
     XlsxService().exportBundle(bundle);
+
+const _downloadsChannel = MethodChannel('busy_budget/downloads');
+
+Future<String> _saveToDownloads(String filename, Uint8List bytes) async {
+  if (Platform.isAndroid) {
+    final savedPath = await _downloadsChannel.invokeMethod<String>('saveFile', {
+      'filename': filename,
+      'bytes': bytes,
+    });
+    if (savedPath == null) throw StateError('다운로드 폴더에 저장하지 못했습니다.');
+    return savedPath;
+  }
+  final downloads = await getDownloadsDirectory();
+  if (downloads == null) throw StateError('다운로드 폴더를 찾을 수 없습니다.');
+  await downloads.create(recursive: true);
+  final file = File(p.join(downloads.path, filename));
+  await file.writeAsBytes(bytes, flush: true);
+  return file.path;
+}
 
 String _displayOption(String value) => switch (value) {
   _ => value.trim().isEmpty ? '?' : value,
@@ -71,6 +93,7 @@ class _BusyBudgetAppState extends State<BusyBudgetApp>
 
   Future<void> _checkAutoBackup() async {
     try {
+      await AppDatabase.instance.purgeExpiredTrash();
       await AutoBackupService.instance.runIfDue();
     } catch (_) {
       // The service stores the error for the Settings screen to report.
@@ -708,11 +731,16 @@ class _LedgerHomeState extends State<LedgerHome> {
         entry.installmentNo != null;
     final isRecurring =
         entry.planType.startsWith('recurring') && entry.planId != null;
+    final isNormal = entry.planType == 'normal';
     final action = await showDialog<String>(
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: const Text('거래 삭제'),
-        content: Text('${entry.title} 거래의 삭제 범위를 선택하세요.'),
+        content: Text(
+          isNormal
+              ? '${entry.title} 거래를 휴지통으로 이동할까요?'
+              : '${entry.title} 거래의 영구 삭제 범위를 선택하세요.',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext),
@@ -720,7 +748,7 @@ class _LedgerHomeState extends State<LedgerHome> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, 'single'),
-            child: const Text('이 거래만'),
+            child: Text(isNormal ? '휴지통으로 이동' : '이 거래만 영구 삭제'),
           ),
           if (isInstallment)
             FilledButton(
@@ -740,20 +768,28 @@ class _LedgerHomeState extends State<LedgerHome> {
       await db.deleteInstallmentsFrom(entry.planId!, entry.installmentNo!);
     } else if (action == 'plan') {
       await db.deleteRecurringPlan(entry.planId!);
+    } else if (isNormal) {
+      await db.moveToTrash(entry.id!);
     } else {
-      await db.delete(entry.id!);
+      await db.permanentlyDelete(entry.id!);
     }
     await _refreshData();
     if (!mounted) return;
     ScaffoldMessenger.of(context).clearSnackBars();
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text('${entry.title} 삭제 완료'),
-        action: action == 'single'
+        duration: const Duration(seconds: 4),
+        showCloseIcon: true,
+        content: Text(
+          isNormal && action == 'single'
+              ? '${entry.title} 휴지통으로 이동 완료'
+              : '${entry.title} 영구 삭제 완료',
+        ),
+        action: isNormal && action == 'single'
             ? SnackBarAction(
                 label: '실행 취소',
                 onPressed: () async {
-                  await db.restoreDeletedEntry(entry);
+                  await db.restoreFromTrash(entry.id!);
                   await _refreshData();
                 },
               )
@@ -2925,6 +2961,19 @@ class SettingsPage extends StatelessWidget {
             ),
             const Divider(height: 1),
             ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: const Text('휴지통'),
+              subtitle: const Text('일반 거래를 복원하거나 영구 삭제합니다. 30일 후 자동 삭제됩니다.'),
+              onTap: () async {
+                await showDialog<void>(
+                  context: context,
+                  builder: (_) => TrashDialog(db: db),
+                );
+                await onChanged();
+              },
+            ),
+            const Divider(height: 1),
+            ListTile(
               leading: const Icon(Icons.file_download_outlined),
               title: const Text('XLSX 전체 백업'),
               subtitle: FutureBuilder<List<String?>>(
@@ -3000,29 +3049,21 @@ class SettingsPage extends StatelessWidget {
       Navigator.of(context, rootNavigator: true).pop();
       progressOpen = false;
 
-      final savedPath = await FilePicker.saveFile(
-        dialogTitle: '가계부 백업 저장',
-        fileName: '가계부_${DateFormat('yyyyMMdd').format(DateTime.now())}.xlsx',
-        type: FileType.custom,
-        allowedExtensions: ['xlsx'],
-        bytes: bytes,
-      );
-      if (savedPath == null) return;
+      final now = DateTime.now();
+      final filename = '가계부_${DateFormat('yyyyMMdd_HHmmss').format(now)}.xlsx';
+      final savedPath = await _saveToDownloads(filename, bytes);
       await db.saveSetting(
         'last_backup_at',
-        DateFormat('yyyy-MM-dd HH:mm').format(DateTime.now()),
+        DateFormat('yyyy-MM-dd HH:mm').format(now),
       );
-      await db.saveSetting(
-        'last_backup_file',
-        savedPath.pathSegments.isEmpty ? 'XLSX' : savedPath.pathSegments.last,
-      );
+      await db.saveSetting('last_backup_file', filename);
       if (context.mounted) {
         await showDialog<void>(
           context: context,
           builder: (dialogContext) => AlertDialog(
             title: const Text('백업 완료'),
             content: Text(
-              '전체 거래 ${bundle.entries.length}건과 정기결제·월별 예산·설정을 XLSX로 저장했습니다.',
+              '전체 거래 ${bundle.entries.length}건과 정기결제·월별 예산·설정을 XLSX로 저장했습니다.\n\n$savedPath',
             ),
             actions: [
               FilledButton(
@@ -3266,6 +3307,155 @@ class _ClearLedgerConfirmationDialogState
       ),
     ],
   );
+}
+
+class TrashDialog extends StatefulWidget {
+  const TrashDialog({super.key, required this.db});
+
+  final AppDatabase db;
+
+  @override
+  State<TrashDialog> createState() => _TrashDialogState();
+}
+
+class _TrashDialogState extends State<TrashDialog> {
+  var entries = <TransactionEntry>[];
+  var loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final result = await widget.db.trashEntries();
+    if (!mounted) return;
+    setState(() {
+      entries = result;
+      loading = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('휴지통'),
+    content: SizedBox(
+      width: 560,
+      height: 460,
+      child: loading
+          ? const Center(child: CircularProgressIndicator())
+          : entries.isEmpty
+          ? const Center(child: Text('휴지통이 비어 있습니다.'))
+          : ListView.separated(
+              itemCount: entries.length,
+              separatorBuilder: (_, _) => const Divider(height: 1),
+              itemBuilder: (context, index) {
+                final entry = entries[index];
+                final deletedAt = entry.deletedAt!;
+                final expiresAt = deletedAt.add(const Duration(days: 30));
+                final remaining =
+                    expiresAt.difference(DateTime.now()).inDays + 1;
+                return ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(entry.title),
+                  subtitle: Text(
+                    '${DateFormat('yyyy년 M월 d일').format(entry.date)} · '
+                    '${NumberFormat('#,###').format(entry.amount)}원 · '
+                    '$remaining일 후 자동 삭제',
+                  ),
+                  trailing: Wrap(
+                    spacing: 2,
+                    children: [
+                      IconButton(
+                        tooltip: '복원',
+                        onPressed: () => _restore(entry),
+                        icon: const Icon(Icons.restore),
+                      ),
+                      IconButton(
+                        tooltip: '영구 삭제',
+                        onPressed: () => _deleteForever(entry),
+                        icon: Icon(
+                          Icons.delete_forever_outlined,
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+    ),
+    actions: [
+      if (entries.isNotEmpty)
+        TextButton.icon(
+          onPressed: _empty,
+          icon: const Icon(Icons.delete_sweep_outlined),
+          label: const Text('휴지통 비우기'),
+        ),
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('닫기'),
+      ),
+    ],
+  );
+
+  Future<void> _restore(TransactionEntry entry) async {
+    await widget.db.restoreFromTrash(entry.id!);
+    await _load();
+    if (mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('${entry.title} 거래를 복원했습니다.')));
+    }
+  }
+
+  Future<void> _deleteForever(TransactionEntry entry) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('영구 삭제'),
+        content: Text('${entry.title} 거래를 영구 삭제할까요? 이 작업은 취소할 수 없습니다.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('취소'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('영구 삭제'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await widget.db.permanentlyDelete(entry.id!);
+    await _load();
+  }
+
+  Future<void> _empty() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('휴지통 비우기'),
+        content: Text(
+          '휴지통의 거래 ${entries.length}건을 모두 영구 삭제할까요? 이 작업은 취소할 수 없습니다.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('취소'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('모두 영구 삭제'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await widget.db.emptyTrash();
+    await _load();
+  }
 }
 
 class RecurringManagerDialog extends StatefulWidget {

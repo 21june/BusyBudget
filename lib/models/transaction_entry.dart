@@ -13,6 +13,7 @@ class TransactionEntry {
     this.planId,
     this.installmentNo,
     this.installmentTotal,
+    this.deletedAt,
   });
 
   final int? id;
@@ -28,6 +29,7 @@ class TransactionEntry {
   final String? planId;
   final int? installmentNo;
   final int? installmentTotal;
+  final DateTime? deletedAt;
 
   Map<String, Object?> toMap() => {
     'id': id,
@@ -43,6 +45,7 @@ class TransactionEntry {
     'plan_id': planId,
     'installment_no': installmentNo,
     'installment_total': installmentTotal,
+    'deleted_at': deletedAt?.toIso8601String(),
   };
 
   factory TransactionEntry.fromMap(Map<String, Object?> map) =>
@@ -60,6 +63,9 @@ class TransactionEntry {
         planId: map['plan_id'] as String?,
         installmentNo: map['installment_no'] as int?,
         installmentTotal: map['installment_total'] as int?,
+        deletedAt: map['deleted_at'] == null
+            ? null
+            : DateTime.parse(map['deleted_at']! as String),
       );
 
   static String _dateKey(DateTime value) =>

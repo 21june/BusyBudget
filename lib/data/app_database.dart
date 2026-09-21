@@ -23,7 +23,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     _database = await openDatabase(
       p.join(dir.path, 'ledger.db'),
-      version: 7,
+      version: 8,
       onCreate: (db, _) async {
         await db.execute('''
           CREATE TABLE transactions(
@@ -39,7 +39,8 @@ class AppDatabase {
             plan_type TEXT NOT NULL DEFAULT 'normal',
             plan_id TEXT,
             installment_no INTEGER,
-            installment_total INTEGER
+            installment_total INTEGER,
+            deleted_at TEXT
           )
         ''');
         await db.execute(
@@ -56,6 +57,7 @@ class AppDatabase {
         await _createSettingsTable(db);
         await _createBudgetsTable(db);
         await _createSearchIndexes(db);
+        await _createTrashSupport(db);
       },
       onUpgrade: (db, oldVersion, _) async {
         if (oldVersion < 2) await _createOptionsTables(db);
@@ -64,8 +66,10 @@ class AppDatabase {
         if (oldVersion < 5) await _createBudgetsTable(db);
         if (oldVersion < 6) await _createSearchIndexes(db);
         if (oldVersion < 7) await _migrateCategoryFlow(db);
+        if (oldVersion < 8) await _createTrashSupport(db);
       },
     );
+    await _purgeExpiredTrash(_database!);
     return _database!;
   }
 
@@ -83,7 +87,7 @@ class AppDatabase {
   }) async {
     final db = await database;
     await _materializeRecurringPayments(db, DateTime.now());
-    final where = <String>[];
+    final where = <String>['deleted_at IS NULL'];
     final args = <Object?>[];
     if (query.trim().isNotEmpty) {
       final pattern = '%${query.trim().toLowerCase()}%';
@@ -137,7 +141,7 @@ class AppDatabase {
     }
     final rows = await db.query(
       'transactions',
-      where: where.isEmpty ? null : where.join(' AND '),
+      where: where.join(' AND '),
       whereArgs: args,
       orderBy: switch (order) {
         'oldest' => 'date ASC, id ASC',
@@ -154,7 +158,7 @@ class AppDatabase {
     await _materializeRecurringPayments(db, DateTime.now());
     final rows = await db.query(
       'transactions',
-      where: 'date >= ? AND date < ?',
+      where: 'deleted_at IS NULL AND date >= ? AND date < ?',
       whereArgs: [
         '${year.toString().padLeft(4, '0')}-01-01',
         '${year + 1}-01-01',
@@ -381,16 +385,45 @@ class AppDatabase {
     });
   }
 
-  Future<void> delete(int id) async =>
-      (await database).delete('transactions', where: 'id = ?', whereArgs: [id]);
-
-  Future<void> restoreDeletedEntry(TransactionEntry entry) async {
-    await (await database).insert(
+  Future<void> moveToTrash(int id) async {
+    await (await database).update(
       'transactions',
-      entry.toMap(),
-      conflictAlgorithm: ConflictAlgorithm.replace,
+      {'deleted_at': DateTime.now().toIso8601String()},
+      where: "id = ? AND plan_type = 'normal' AND deleted_at IS NULL",
+      whereArgs: [id],
     );
   }
+
+  Future<List<TransactionEntry>> trashEntries() async {
+    await purgeExpiredTrash();
+    final rows = await (await database).query(
+      'transactions',
+      where: 'deleted_at IS NOT NULL',
+      orderBy: 'deleted_at DESC, id DESC',
+    );
+    return rows.map(TransactionEntry.fromMap).toList();
+  }
+
+  Future<void> restoreFromTrash(int id) async => (await database).update(
+    'transactions',
+    {'deleted_at': null},
+    where: 'id = ? AND deleted_at IS NOT NULL',
+    whereArgs: [id],
+  );
+
+  Future<void> permanentlyDelete(int id) async => (await database).delete(
+    'transactions',
+    where: 'id = ?',
+    whereArgs: [id],
+  );
+
+  Future<int> emptyTrash() async => (await database).delete(
+    'transactions',
+    where: 'deleted_at IS NOT NULL',
+  );
+
+  Future<int> purgeExpiredTrash() async =>
+      _purgeExpiredTrash(await database);
 
   Future<void> deleteInstallmentsFrom(String planId, int installmentNo) async {
     await (await database).delete(
@@ -472,7 +505,8 @@ class AppDatabase {
       '''
       SELECT COALESCE(SUM(amount), 0) AS total
       FROM transactions
-      WHERE plan_type = 'installment' AND flow = '지출'
+      WHERE deleted_at IS NULL
+        AND plan_type = 'installment' AND flow = '지출'
         AND date >= ? AND date < ?
       ''',
       [_dateKey(start), _dateKey(next)],
@@ -521,7 +555,7 @@ class AppDatabase {
 
   Future<int> transactionCount() async {
     final rows = await (await database).rawQuery(
-      'SELECT COUNT(*) AS value FROM transactions',
+      'SELECT COUNT(*) AS value FROM transactions WHERE deleted_at IS NULL',
     );
     return rows.first['value']! as int;
   }
@@ -617,7 +651,7 @@ class AppDatabase {
         UNION ALL
         SELECT DISTINCT $field AS name, 2147483647 AS sort_order
         FROM transactions
-        WHERE $field <> '' ${flowFilter ? 'AND flow = ?' : ''}
+        WHERE deleted_at IS NULL AND $field <> '' ${flowFilter ? 'AND flow = ?' : ''}
       )
       GROUP BY name
       ORDER BY MIN(sort_order), name
@@ -649,7 +683,7 @@ class AppDatabase {
     final db = await database;
     final flowFilter = type == 'category' ? (flow ?? '지출') : null;
     final usedRows = await db.rawQuery(
-      'SELECT COUNT(*) AS value FROM transactions WHERE $field = ?'
+      'SELECT COUNT(*) AS value FROM transactions WHERE deleted_at IS NULL AND $field = ?'
       '${flowFilter == null ? '' : ' AND flow = ?'}',
       [
         name,
@@ -676,7 +710,7 @@ class AppDatabase {
       '''
       SELECT $field AS value, COUNT(*) AS frequency, MAX(date) AS recent
       FROM transactions
-      WHERE $field <> '' AND LOWER($field) LIKE ?
+      WHERE deleted_at IS NULL AND $field <> '' AND LOWER($field) LIKE ?
       GROUP BY $field
       ORDER BY CASE WHEN LOWER($field) LIKE ? THEN 0 ELSE 1 END,
                frequency DESC, recent DESC
@@ -1031,6 +1065,27 @@ class AppDatabase {
     );
     await db.execute(
       'CREATE INDEX IF NOT EXISTS idx_transactions_amount ON transactions(amount)',
+    );
+  }
+
+  static Future<void> _createTrashSupport(DatabaseExecutor db) async {
+    final columns = await db.rawQuery('PRAGMA table_info(transactions)');
+    if (!columns.any((column) => column['name'] == 'deleted_at')) {
+      await db.execute('ALTER TABLE transactions ADD COLUMN deleted_at TEXT');
+    }
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_transactions_deleted_at ON transactions(deleted_at)',
+    );
+  }
+
+  static Future<int> _purgeExpiredTrash(DatabaseExecutor db) {
+    final cutoff = DateTime.now()
+        .subtract(const Duration(days: 30))
+        .toIso8601String();
+    return db.delete(
+      'transactions',
+      where: 'deleted_at IS NOT NULL AND deleted_at <= ?',
+      whereArgs: [cutoff],
     );
   }
 
